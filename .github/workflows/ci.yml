@@ -88,6 +88,9 @@ jobs:
       - name: Run Gosec Security Scanner
         uses: securego/gosec@master
         with:
+          # G104: Unhandled Close() errors in deferred cleanup - errors are non-actionable
+          # G301/G306: Directory permissions (0750/0600) for cache - intentionally restrictive
+          # G304: File read path from internal cache location - not user-controlled
           args: -exclude=G104,G301,G304,G306 ./...
 
       - name: Run govulncheck
