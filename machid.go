@@ -5,18 +5,19 @@
 package machid
 
 import (
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
-	"errors"
-	"fmt"
-	"io"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"strings"
-	"sync"
-	"time"
+"crypto/rand"
+"crypto/sha256"
+"encoding/hex"
+"encoding/json"
+"errors"
+"fmt"
+"io"
+"os"
+"os/exec"
+"path/filepath"
+"strings"
+"sync"
+"time"
 )
 
 // Error definitions
@@ -328,34 +329,33 @@ func clearString(s *string) {
 
 // GenerateEMachID generates an Ephemeral Machine Identifier.
 // This ID is unique and can only be generated once (based on current Unix nanosecond time and salt).
+// 
+// Unlike GenerateReMachID, this function does NOT require root privileges since
+// it only uses the current timestamp and salt, not hardware identifiers.
 //
 // Parameters:
 //   - salt: A non-empty string used to add entropy to the hash
 //
 // Returns:
 //   - The eMachID as a hex-encoded SHA-256 hash
-//   - An error if root privileges are missing or salt is empty
+//   - An error if salt is empty
 //
 // Security: The salt and time values are cleared from memory after hashing.
 func GenerateEMachID(salt string) (string, error) {
-	if err := checkRoot(); err != nil {
-		return "", err
-	}
+if salt == "" {
+return "", ErrEmptySalt
+}
 
-	if salt == "" {
-		return "", ErrEmptySalt
-	}
+// Get current time in nanoseconds for maximum uniqueness
+timestamp := fmt.Sprintf("%d", time.Now().UnixNano())
 
-	// Get current time in nanoseconds for maximum uniqueness
-	timestamp := fmt.Sprintf("%d", time.Now().UnixNano())
+// Create the hash
+emachid := hashData(timestamp, salt)
 
-	// Create the hash
-	emachid := hashData(timestamp, salt)
+// Clear the salt copy (the original is the caller's responsibility)
+clearString(&timestamp)
 
-	// Clear the salt copy (the original is the caller's responsibility)
-	clearString(&timestamp)
-
-	return emachid, nil
+return emachid, nil
 }
 
 // GenerateReMachID generates a Reconstructable Machine Identifier.
@@ -505,11 +505,310 @@ func ClearFallbackFiles() error {
 
 // HasFallbackFiles returns true if the filesystem fallback files exist.
 func HasFallbackFiles() bool {
-	serialPath := filepath.Join(fallbackDir, fallbackSerialFile)
-	uuidPath := filepath.Join(fallbackDir, fallbackUUIDFile)
+serialPath := filepath.Join(fallbackDir, fallbackSerialFile)
+uuidPath := filepath.Join(fallbackDir, fallbackUUIDFile)
 
-	_, serialErr := os.Stat(serialPath)
-	_, uuidErr := os.Stat(uuidPath)
+_, serialErr := os.Stat(serialPath)
+_, uuidErr := os.Stat(uuidPath)
 
-	return serialErr == nil && uuidErr == nil
+return serialErr == nil && uuidErr == nil
+}
+
+// ================================================================================
+// Caching API
+// ================================================================================
+//
+// The caching system allows applications to cache machine IDs to avoid requiring
+// sudo on every run. The first run with sudo generates and caches the IDs, and
+// subsequent runs can use the cached values without elevated privileges.
+
+// CachedMachineIDs holds cached machine identifiers
+type CachedMachineIDs struct {
+ReMachID    string `json:"remach_id"`
+EMachID     string `json:"emach_id,omitempty"`
+Salt        string `json:"salt,omitempty"`
+ActionCount int    `json:"action_count"`
+CreatedAt   int64  `json:"created_at,omitempty"`
+}
+
+// Default cache directory (user-specific)
+var (
+cacheSubDir  = ".config/machid"
+cacheFile    = "cache.json"
+)
+
+// getCacheDir returns the appropriate cache directory based on sudo status
+func getCacheDir() string {
+var home string
+
+// Check if running with sudo - use the real user's home
+if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+home = filepath.Join("/home", sudoUser)
+if _, err := os.Stat(home); err != nil {
+// Fallback to /tmp
+return filepath.Join("/tmp", cacheSubDir)
+}
+} else {
+var err error
+home, err = os.UserHomeDir()
+if err != nil {
+return filepath.Join("/tmp", cacheSubDir)
+}
+}
+
+return filepath.Join(home, cacheSubDir)
+}
+
+// getCachePath returns the full path to the cache file
+func getCachePath() string {
+return filepath.Join(getCacheDir(), cacheFile)
+}
+
+// LoadCachedIDs loads cached machine IDs from disk.
+// Returns nil if no cache exists or cache is invalid.
+func LoadCachedIDs() (*CachedMachineIDs, error) {
+data, err := os.ReadFile(getCachePath())
+if err != nil {
+return nil, err
+}
+
+var cache CachedMachineIDs
+if err := json.Unmarshal(data, &cache); err != nil {
+return nil, err
+}
+
+return &cache, nil
+}
+
+// SaveCachedIDs saves machine IDs to the cache file.
+// When running with sudo, it fixes ownership so the real user can read the file.
+func SaveCachedIDs(cache *CachedMachineIDs) error {
+cacheDir := getCacheDir()
+if err := os.MkdirAll(cacheDir, 0755); err != nil {
+return err
+}
+
+data, err := json.MarshalIndent(cache, "", "  ")
+if err != nil {
+return err
+}
+
+cachePath := getCachePath()
+if err := os.WriteFile(cachePath, data, 0644); err != nil {
+return err
+}
+
+// If running with sudo, fix ownership so the real user can read it
+if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+if uidStr := os.Getenv("SUDO_UID"); uidStr != "" {
+if gidStr := os.Getenv("SUDO_GID"); gidStr != "" {
+var uid, gid int
+fmt.Sscanf(uidStr, "%d", &uid)
+fmt.Sscanf(gidStr, "%d", &gid)
+os.Chown(cacheDir, uid, gid)
+os.Chown(cachePath, uid, gid)
+}
+}
+}
+
+return nil
+}
+
+// ClearCache removes the cached machine IDs.
+func ClearCache() error {
+cachePath := getCachePath()
+if err := os.Remove(cachePath); err != nil && !os.IsNotExist(err) {
+return err
+}
+return nil
+}
+
+// GetOrGenerateReMachID attempts to load the cached reMachID, or generates a new one.
+// If generation is needed, sudo is required. The generated ID is cached for future use.
+//
+// Parameters:
+//   - salt: Salt for the machine ID (must match previous runs for consistent IDs)
+//
+// Returns:
+//   - The reMachID
+//   - Whether the ID was loaded from cache (true) or freshly generated (false)
+//   - An error if generation fails (including if sudo is required but not available)
+func GetOrGenerateReMachID(salt string) (remachid string, fromCache bool, err error) {
+// Try loading from cache first
+cache, err := LoadCachedIDs()
+if err == nil && cache.ReMachID != "" {
+// Verify salt matches if provided in cache
+if cache.Salt == "" || cache.Salt == salt {
+return cache.ReMachID, true, nil
+}
+// Salt mismatch - need to regenerate
+logWarning("WARNING: machid - Salt mismatch in cache, regenerating reMachID")
+}
+
+// Need to generate - this requires sudo
+remachid, err = GenerateReMachID(salt)
+if err != nil {
+return "", false, err
+}
+
+// Save to cache
+newCache := &CachedMachineIDs{
+ReMachID:  remachid,
+Salt:      salt,
+CreatedAt: time.Now().Unix(),
+}
+
+// Try to preserve existing eMachID if present
+if cache != nil && cache.EMachID != "" {
+newCache.EMachID = cache.EMachID
+newCache.ActionCount = cache.ActionCount
+}
+
+if saveErr := SaveCachedIDs(newCache); saveErr != nil {
+logWarning(fmt.Sprintf("WARNING: machid - Failed to cache reMachID: %v", saveErr))
+}
+
+return remachid, false, nil
+}
+
+// GetOrGenerateEMachID attempts to load the cached eMachID, or generates a new one.
+// This function does NOT require sudo since eMachID generation uses timestamps only.
+//
+// Parameters:
+//   - salt: Salt for the machine ID
+//
+// Returns:
+//   - The eMachID
+//   - Whether the ID was loaded from cache (true) or freshly generated (false)
+//   - An error if generation fails
+func GetOrGenerateEMachID(salt string) (emachid string, fromCache bool, err error) {
+// Try loading from cache first
+cache, err := LoadCachedIDs()
+if err == nil && cache.EMachID != "" {
+return cache.EMachID, true, nil
+}
+
+// Generate new eMachID (no sudo required)
+emachid, err = GenerateEMachID(salt)
+if err != nil {
+return "", false, err
+}
+
+// Save to cache (or update existing cache with eMachID)
+var newCache *CachedMachineIDs
+if cache != nil {
+newCache = cache
+newCache.EMachID = emachid
+} else {
+newCache = &CachedMachineIDs{
+EMachID:   emachid,
+Salt:      salt,
+CreatedAt: time.Now().Unix(),
+}
+}
+
+if saveErr := SaveCachedIDs(newCache); saveErr != nil {
+logWarning(fmt.Sprintf("WARNING: machid - Failed to cache eMachID: %v", saveErr))
+}
+
+return emachid, false, nil
+}
+
+// GetOrGenerateBoth loads or generates both machine IDs.
+// For reMachID, sudo is required if not cached.
+// For eMachID, sudo is never required.
+//
+// Parameters:
+//   - salt: Salt for both machine IDs
+//
+// Returns:
+//   - CachedMachineIDs containing both IDs
+//   - An error if reMachID generation fails (typically if sudo is needed but not available)
+func GetOrGenerateBoth(salt string) (*CachedMachineIDs, error) {
+// Try to get reMachID first (may require sudo)
+remachid, reCached, err := GetOrGenerateReMachID(salt)
+if err != nil {
+return nil, fmt.Errorf("failed to get reMachID: %w", err)
+}
+
+// Get eMachID (never requires sudo)
+emachid, eCached, err := GetOrGenerateEMachID(salt)
+if err != nil {
+return nil, fmt.Errorf("failed to get eMachID: %w", err)
+}
+
+// Load full cache to get action count
+cache, _ := LoadCachedIDs()
+actionCount := 0
+if cache != nil {
+actionCount = cache.ActionCount
+}
+
+result := &CachedMachineIDs{
+ReMachID:    remachid,
+EMachID:     emachid,
+Salt:        salt,
+ActionCount: actionCount,
+}
+
+// Log caching status
+if reCached && eCached {
+logWarning("✓ Using cached machine IDs (no sudo required)")
+} else if reCached {
+logWarning("✓ Using cached reMachID, generated new eMachID")
+} else {
+logWarning("✓ Generated and cached machine IDs")
+}
+
+return result, nil
+}
+
+// RotateEMachID generates a new eMachID and updates the cache.
+// This should be called when you need to refresh the ephemeral ID.
+// Does NOT require sudo.
+//
+// Parameters:
+//   - salt: Salt for the new eMachID
+//
+// Returns:
+//   - The new eMachID
+//   - An error if generation or caching fails
+func RotateEMachID(salt string) (string, error) {
+// Generate new eMachID
+emachid, err := GenerateEMachID(salt)
+if err != nil {
+return "", err
+}
+
+// Load existing cache
+cache, _ := LoadCachedIDs()
+if cache == nil {
+cache = &CachedMachineIDs{Salt: salt}
+}
+
+// Update with new eMachID
+cache.EMachID = emachid
+cache.ActionCount = 0
+
+if err := SaveCachedIDs(cache); err != nil {
+return "", fmt.Errorf("failed to save rotated eMachID: %w", err)
+}
+
+return emachid, nil
+}
+
+// IncrementActionCount increments the action counter in the cache.
+// Returns the new action count.
+func IncrementActionCount() (int, error) {
+cache, err := LoadCachedIDs()
+if err != nil {
+return 0, err
+}
+
+cache.ActionCount++
+if err := SaveCachedIDs(cache); err != nil {
+return 0, err
+}
+
+return cache.ActionCount, nil
 }

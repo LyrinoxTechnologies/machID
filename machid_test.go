@@ -78,14 +78,11 @@ t.Errorf("GenerateEMachID() with empty salt expected ErrEmptySalt, got: %v", err
 }
 
 func TestGenerateEMachID_NotRoot(t *testing.T) {
-// Skip if running as root
-if os.Geteuid() == 0 {
-t.Skip("Test requires non-root user")
-}
-
+// GenerateEMachID should work without root privileges
+// since it only uses timestamp and salt, not hardware IDs
 _, err := GenerateEMachID("test-salt")
-if err != ErrNotRoot {
-t.Errorf("GenerateEMachID() expected ErrNotRoot when not root, got: %v", err)
+if err != nil {
+t.Errorf("GenerateEMachID() should work without root, got error: %v", err)
 }
 }
 
@@ -187,12 +184,8 @@ t.Logf("Placeholder value '%s' should be filtered to empty string", p)
 }
 }
 
-// Integration tests - only run as root
-func TestGenerateEMachID_AsRoot(t *testing.T) {
-if os.Geteuid() != 0 {
-t.Skip("Test requires root privileges")
-}
-
+// Test eMachID generation (works without root)
+func TestGenerateEMachID_Works(t *testing.T) {
 salt := "test-salt-12345"
 
 // Generate two eMachIDs
@@ -206,7 +199,7 @@ if err != nil {
 t.Fatalf("GenerateEMachID() second call failed: %v", err)
 }
 
-// They should be different (ephemeral)
+// They should be different (ephemeral - based on nanosecond timestamp)
 if id1 == id2 {
 t.Error("GenerateEMachID() produced same ID twice (should be ephemeral)")
 }
@@ -216,6 +209,8 @@ if len(id1) != 64 {
 t.Errorf("GenerateEMachID() produced wrong length: got %d, expected 64", len(id1))
 }
 }
+
+// Integration tests - only run as root
 
 func TestGenerateReMachID_AsRoot(t *testing.T) {
 if os.Geteuid() != 0 {
