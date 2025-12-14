@@ -51,6 +51,8 @@ jobs:
   codeql:
     name: CodeQL Analysis
     runs-on: ubuntu-latest
+    # CodeQL requires enabling Code Scanning in repo settings first
+    if: false
     permissions:
       actions: read
       contents: read
